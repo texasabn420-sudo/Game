@@ -1,9 +1,9 @@
--- Mod Menu v3.0 (Rayfield Gen 2)
+-- Mod Menu v3.3 (Rayfield Gen 2)
 -- Full conversion of mod-menu v2.4-fixed2: every feature carried over,
 -- only the GUI layer changed - custom frames/categories replaced by a
 -- Rayfield window (same library as the seed farm). Feature logic is the
 -- v2.4 code verbatim wherever possible.
-print("[ModMenu] v3.0 (Rayfield) loading...")
+print("[ModMenu] v3.3 (Rayfield) loading...")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -38,6 +38,8 @@ local Config = {
     },
 }
 
+local featureToggles = {} -- Rayfield handles, filled by the GUI section (for Stop Everything)
+
 local toggles = {
     speedBoost = false,
     infiniteJump = false,
@@ -53,7 +55,6 @@ local State = {
     noClipParts = {},
     playerESPObjects = {},
     playerConnections = {},
-    basePromptESP = {},
     originalHoldDurations = {},
     savedPositions = { [1] = nil, [2] = nil, [3] = nil },
     selectedSlots = {},
@@ -403,195 +404,307 @@ local function setPlayerESP(on)
 end
 
 --============================================================================
--- BASE ESP logic (blue prompt markers)
+-- BASE ESP logic (Base Name ESP engine - replaces the old blue
+-- prompt markers. Occupied secret-room bases with the OWNER'S NAME,
+-- event-driven: markers paint the frame content streams in. Markers
+-- ride on each base's entrance at map level.)
 --============================================================================
-local function getESPParent()
-    return player:FindFirstChildOfClass("PlayerGui")
-        or player:WaitForChild("PlayerGui", 10)
+local baseEspOn = false
+local baseMarkers = {} -- [room] = {bb, label, anchor, roomPart, ownerResolved}
+local baseNameCache = {}
+local baseIdChecked = {}
+local baseDirty = {}
+local baseRoomConns = {}
+local baseLiveConns = {}
+local basePg = player:WaitForChild("PlayerGui")
+
+local function baseNameForUserId(id)
+    local num = tonumber(id)
+    if not num then return nil end
+    if baseNameCache[num] then return baseNameCache[num] end
+    local p = Players:GetPlayerByUserId(num)
+    if p then
+        baseNameCache[num] = p.Name
+        return p.Name
+    end
+    local nm = nil
+    pcall(function() nm = Players:GetNameByUserIdAsync(num) end)
+    if nm then baseNameCache[num] = nm end
+    return nm
 end
 
-local function getBluePromptESPFolder()
-    local target = getESPParent()
-    local ok, folder = pcall(function()
-        local existing = target:FindFirstChild("BlueTextPromptESP")
-        if existing then return existing end
-        local f = Instance.new("Folder")
-        f.Name = "BlueTextPromptESP"
-        f.Parent = target
-        return f
+local function baseOwnerText(nm)
+    if nm == "NPC BASE" then return "ð  NPC BASE" end
+    return "ð  " .. nm .. "'s base"
+end
+
+local function baseResolveOwner(room)
+    -- the room's own name: Interior_<id>. Non-positive = NPC room;
+    -- positive = the owner's UserId (live-proven).
+    local nameId = room.Name:match("_(%-?%d+)$")
+    if not nameId then return nil end
+    if tonumber(nameId) <= 0 then return "NPC BASE" end
+    local nm = baseNameForUserId(nameId)
+    if not baseIdChecked[room] then
+        baseIdChecked[room] = true
+        print("[ModMenu] Base ESP: " .. room.Name .. " owner id " .. nameId .. " -> " .. (nm or "not resolved yet"))
+    end
+    return nm
+end
+
+local function baseRoomOccupied(room)
+    local extras = 0
+    for _, ch in ipairs(room:GetChildren()) do
+        if not ch.Name:find("^Expand") then extras += 1 end
+    end
+    if extras > 0 then return true end
+    for _, d in ipairs(room:GetDescendants()) do
+        if d:IsA("ProximityPrompt") or d:IsA("SurfaceGui") or d:IsA("Humanoid") then
+            return true
+        end
+    end
+    return false
+end
+
+local function baseEntrancePart(room)
+    local suffix = room.Name:match("_(%-?%d+)$")
+    if not suffix then return nil end
+    local sr = Workspace:FindFirstChild("SecretRooms")
+    local ent = sr and sr:FindFirstChild("Entrance_" .. suffix)
+    if not ent then return nil end
+    return ent.PrimaryPart or ent:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function baseMarkRoom(room, pivot)
+    if baseMarkers[room] then return end
+    local owner = baseResolveOwner(room)
+    local part = room:FindFirstChildWhichIsA("BasePart", true)
+    local anchor = nil
+    if not part then
+        anchor = Instance.new("Part")
+        anchor.Name = "BaseESPAnchor"
+        anchor.Size = Vector3.new(1, 1, 1)
+        anchor.Transparency = 1
+        anchor.CanCollide = false
+        anchor.CanQuery = false
+        anchor.Anchored = true
+        anchor.Position = pivot
+        anchor.Parent = Workspace
+        part = anchor
+    end
+    local bb = Instance.new("BillboardGui")
+    bb.Name = "BaseMark"
+    bb.Size = UDim2.new(0, 240, 0, 40)
+    bb.StudsOffset = Vector3.new(0, 3, 0)
+    bb.AlwaysOnTop = true
+    bb.MaxDistance = 100000
+    bb.Adornee = part
+    local tl = Instance.new("TextLabel")
+    tl.Size = UDim2.new(1, 0, 1, 0)
+    tl.BackgroundColor3 = Color3.fromRGB(200, 120, 20)
+    tl.BackgroundTransparency = 0.2
+    tl.TextColor3 = Color3.new(1, 1, 1)
+    tl.Font = Enum.Font.GothamBold
+    tl.TextSize = 13
+    tl.Text = owner and baseOwnerText(owner) or "ð  OCCUPIED"
+    tl.Parent = bb
+    Instance.new("UICorner", tl).CornerRadius = UDim.new(0, 6)
+    bb.Parent = basePg
+    baseMarkers[room] = { bb = bb, label = tl, anchor = anchor, roomPart = part, ownerResolved = owner ~= nil }
+end
+
+local function baseUnmarkRoom(room)
+    local mk = baseMarkers[room]
+    if mk then
+        pcall(function() mk.bb:Destroy() end)
+        if mk.anchor then pcall(function() mk.anchor:Destroy() end) end
+        baseMarkers[room] = nil
+    end
+end
+
+local function baseClearMarkers()
+    for room in pairs(baseMarkers) do baseUnmarkRoom(room) end
+end
+
+local function baseRefreshOwner(room)
+    local mk = baseMarkers[room]
+    if not mk or mk.ownerResolved then return end
+    local nm = baseResolveOwner(room)
+    if nm then
+        mk.ownerResolved = true
+        mk.label.Text = baseOwnerText(nm)
+    end
+end
+
+local function baseRefreshPlacement(room)
+    local mk = baseMarkers[room]
+    if not mk then return end
+    local entPart = baseEntrancePart(room)
+    local target = entPart or mk.roomPart or mk.anchor
+    if target and mk.bb.Adornee ~= target then
+        mk.bb.Adornee = target
+    end
+end
+
+local function baseScanOnce()
+    local rooms = Workspace:FindFirstChild("SecretRooms")
+    if not rooms then return end
+    for _, room in ipairs(rooms:GetChildren()) do
+        if room.Name:sub(1, 9) ~= "Entrance_" then
+            if baseRoomOccupied(room) then
+                local ok, piv = pcall(function() return room:GetPivot().Position end)
+                if ok then
+                    baseMarkRoom(room, piv)
+                    baseRefreshOwner(room)
+                    baseRefreshPlacement(room)
+                end
+            else
+                baseUnmarkRoom(room)
+            end
+        end
+    end
+    for room in pairs(baseMarkers) do
+        if not room.Parent then baseUnmarkRoom(room) end
+    end
+end
+
+-- streaming sweep points: housing map + the Y=10000 room grid
+local basePoints = {}
+for _, gx in ipairs({ -300, -100, 100, 300 }) do
+    for _, gz in ipairs({ -100, 100, 300, 500, 700 }) do
+        basePoints[#basePoints + 1] = Vector3.new(gx, 40, gz)
+    end
+end
+for _, gx in ipairs({ -600, -300, 0, 300, 600 }) do
+    for _, gz in ipairs({ -600, -300, 0, 300, 600 }) do
+        basePoints[#basePoints + 1] = Vector3.new(gx, 10000, gz)
+    end
+end
+
+local baseEspGen = 0
+local function baseSweepLoop(gen)
+    while baseEspOn and gen == baseEspGen do
+        for i = 1, #basePoints do
+            local point = basePoints[i]
+            task.spawn(function()
+                pcall(function()
+                    player:RequestStreamAroundAsync(point, 2)
+                end)
+            end)
+        end
+        task.wait(4)
+    end
+end
+
+-- zero-second refresh: events queue rooms, Heartbeat paints them
+local function baseQueueRoom(room)
+    if room then baseDirty[room] = true end
+end
+
+local function baseWatchRoom(room)
+    if baseRoomConns[room] then return end
+    baseRoomConns[room] = room.DescendantAdded:Connect(function()
+        baseQueueRoom(room)
     end)
-    if ok and folder then return folder end
-    warn("[ModMenu] Could not create ESP folder: " .. tostring(folder))
-    return nil
 end
 
-local BASE_PROMPT_KEYWORDS = { "enter", "open", "door", "gate", "access", "lock", "house", "base" }
+local function baseUnwatchRoom(room)
+    local c = baseRoomConns[room]
+    if c then c:Disconnect() baseRoomConns[room] = nil end
+end
 
-local ApplyBluePromptESP -- forward declaration (defined below, used by evaluateBasePrompt)
-
-local function isBaseDoorPrompt(object)
-    if not object:IsA("ProximityPrompt") then return false end
-    local actionTextLower = string.lower(object.ActionText)
-    local objectTextLower = string.lower(object.ObjectText)
-    for _, keyword in ipairs(BASE_PROMPT_KEYWORDS) do
-        if string.find(actionTextLower, keyword, 1, true)
-            or string.find(objectTextLower, keyword, 1, true) then
-            return true
-        end
+local function baseProcessRoom(room)
+    if not room.Parent then
+        baseUnwatchRoom(room)
+        baseUnmarkRoom(room)
+        return
     end
-    return false
-end
-
-local function isOwnBasePrompt(object)
-    local ownName = player.Name:lower()
-    local ownId = tostring(player.UserId)
-    for _, segment in ipairs(string.split(object:GetFullName():lower(), ".")) do
-        if segment == ownName or segment == ownId then
-            return true
+    baseWatchRoom(room)
+    if baseRoomOccupied(room) then
+        local ok, piv = pcall(function() return room:GetPivot().Position end)
+        if ok then
+            baseMarkRoom(room, piv)
+            baseRefreshOwner(room)
+            baseRefreshPlacement(room)
         end
+    else
+        baseUnmarkRoom(room)
     end
-    return false
 end
 
-local function matchBaseOwner(object, playerLookup)
-    for _, segment in ipairs(string.split(object:GetFullName():lower(), ".")) do
-        if playerLookup[segment] then
-            return playerLookup[segment]
+local function baseProcessQueue()
+    if not baseEspOn then return end
+    if next(baseDirty) == nil then return end
+    local batch = baseDirty
+    baseDirty = {}
+    for room in pairs(batch) do
+        pcall(baseProcessRoom, room)
+    end
+end
+
+local function baseBindEvents()
+    local rooms = Workspace:FindFirstChild("SecretRooms")
+    if not rooms then
+        baseLiveConns[#baseLiveConns + 1] = Workspace.ChildAdded:Connect(function(ch)
+            if ch.Name == "SecretRooms" then baseBindEvents() end
+        end)
+        return
+    end
+    baseLiveConns[#baseLiveConns + 1] = rooms.ChildAdded:Connect(function(ch)
+        if ch.Name:sub(1, 9) == "Entrance_" then
+            baseQueueRoom(rooms:FindFirstChild("Interior_" .. ch.Name:sub(10)))
+        else
+            baseQueueRoom(ch)
         end
-    end
-    local part = object.Parent
-    if part and part:IsA("BasePart") then
-        for attrName, attrValue in pairs(part:GetAttributes()) do
-            local valStr = tostring(attrValue):lower()
-            if playerLookup[valStr] then return playerLookup[valStr] end
-            if playerLookup[attrName:lower()] then return playerLookup[attrName:lower()] end
+    end)
+    baseLiveConns[#baseLiveConns + 1] = rooms.ChildRemoved:Connect(function(ch)
+        if ch.Name:sub(1, 9) == "Entrance_" then
+            baseQueueRoom(rooms:FindFirstChild("Interior_" .. ch.Name:sub(10)))
+        else
+            baseUnwatchRoom(ch)
+            baseUnmarkRoom(ch)
         end
+    end)
+    baseLiveConns[#baseLiveConns + 1] = RunService.Heartbeat:Connect(baseProcessQueue)
+    for _, ch in ipairs(rooms:GetChildren()) do
+        if ch.Name:sub(1, 9) ~= "Entrance_" then baseQueueRoom(ch) end
     end
-    return nil
 end
 
-local function evaluateBasePrompt(object, playerLookup, espFolder)
-    if not espFolder then return end
-    if not isBaseDoorPrompt(object) then return end
-    local targetPart = object.Parent
-    if not targetPart or not targetPart:IsA("BasePart") then return end
-    if State.basePromptESP[targetPart] then return end
-    if isOwnBasePrompt(object) then return end
-    local matchedOwner = matchBaseOwner(object, playerLookup) or "Other Player"
-    State.basePromptESP[targetPart] = ApplyBluePromptESP(targetPart, matchedOwner, espFolder)
-end
-
-function ApplyBluePromptESP(part, playerUsername, espFolder)
-    local billboard = Instance.new("BillboardGui")
-    billboard.Name = "BluePromptBillboard"
-    billboard.AlwaysOnTop = true
-    billboard.StudsOffset = Vector3.new(0, 5.5, 0)
-    billboard.Adornee = part
-    billboard.Size = UDim2.new(10, 0, 3, 0)
-    billboard.Parent = espFolder
-
-    local panel = Instance.new("Frame")
-    panel.Size = UDim2.new(1, 0, 1, 0)
-    panel.BackgroundColor3 = Color3.fromRGB(10, 20, 35)
-    panel.BackgroundTransparency = 0.18
-    panel.Parent = billboard
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(120, 220, 255)
-    stroke.Thickness = 2.6
-    stroke.Parent = panel
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -12, 1, -10)
-    label.Position = UDim2.new(0, 6, 0, 5)
-    label.BackgroundTransparency = 1
-    label.Text = playerUsername
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 22
-    label.TextColor3 = Color3.fromRGB(120, 220, 255)
-    label.Parent = panel
-
-    return { Billboard = billboard, Label = label, OwnerName = playerUsername }
+local function baseUnbindEvents()
+    for _, c in ipairs(baseLiveConns) do pcall(function() c:Disconnect() end) end
+    baseLiveConns = {}
+    for room in pairs(baseRoomConns) do baseUnwatchRoom(room) end
+    baseDirty = {}
 end
 
 local function StartPlayerBaseTracking()
-    if State.loops.playerBase then return true end
-
-    local espFolder = getBluePromptESPFolder()
-    if not espFolder then
-        return false
+    for _, d in ipairs(basePg:GetChildren()) do
+        if d.Name == "BaseMark" then d:Destroy() end
     end
-
-    local function buildPlayerLookup()
-        local lookup = {}
-        for _, p in ipairs(Players:GetPlayers()) do
-            if p ~= player then
-                lookup[p.Name:lower()] = p.Name
-                lookup[tostring(p.UserId)] = p.Name
-            end
-        end
-        return lookup
+    for _, d in ipairs(Workspace:GetChildren()) do
+        if d.Name == "BaseESPAnchor" then d:Destroy() end
     end
-
-    do
-        local lookup = buildPlayerLookup()
-        for _, object in ipairs(Workspace:GetDescendants()) do
-            if object:IsA("ProximityPrompt") then
-                evaluateBasePrompt(object, lookup, espFolder)
-            end
+    baseEspGen += 1
+    local gen = baseEspGen
+    baseEspOn = true
+    pcall(baseScanOnce)
+    baseBindEvents()
+    task.spawn(baseSweepLoop, gen)
+    task.spawn(function()
+        while baseEspOn and gen == baseEspGen do
+            task.wait(30)
+            if baseEspOn and gen == baseEspGen then pcall(baseScanOnce) end
         end
-    end
-
-    if State.connections.basePromptAdded then
-        State.connections.basePromptAdded:Disconnect()
-    end
-    State.connections.basePromptAdded = Workspace.DescendantAdded:Connect(function(descendant)
-        if descendant:IsA("ProximityPrompt") then
-            task.spawn(function()
-                evaluateBasePrompt(descendant, buildPlayerLookup(), getBluePromptESPFolder())
-            end)
-        end
-    end)
-
-    State.loops.playerBase = task.spawn(function()
-        while Config.ESP.PlayerBases do
-            local myRoot = GetRoot(GetCharacter())
-            for part, entry in pairs(State.basePromptESP) do
-                if not part.Parent or not entry.Billboard.Parent then
-                    safeDestroy(entry.Billboard)
-                    State.basePromptESP[part] = nil
-                elseif myRoot then
-                    local dist = math.floor((myRoot.Position - part.Position).Magnitude)
-                    local txt = entry.OwnerName .. " [" .. dist .. " studs]"
-                    if entry.Label.Text ~= txt then
-                        entry.Label.Text = txt
-                    end
-                end
-            end
-            task.wait(1)
-        end
-        State.loops.playerBase = nil
     end)
     return true
 end
 
 local function StopPlayerBaseTracking()
-    if State.loops.playerBase then
-        task.cancel(State.loops.playerBase)
-        State.loops.playerBase = nil
-    end
-
-    if State.connections.basePromptAdded then
-        State.connections.basePromptAdded:Disconnect()
-        State.connections.basePromptAdded = nil
-    end
-
-    for _, entry in pairs(State.basePromptESP) do
-        if entry.Billboard then safeDestroy(entry.Billboard) end
-    end
-    table.clear(State.basePromptESP)
-    local folder = getESPParent():FindFirstChild("BlueTextPromptESP")
-    if folder then folder:Destroy() end
+    baseEspGen += 1
+    baseEspOn = false
+    baseUnbindEvents()
+    baseClearMarkers()
 end
 
 local baseEspToggle -- forward: set by the GUI section so failures can reset it
@@ -620,11 +733,12 @@ local function setPlayerHitbox(targetPlayer, expanded)
         if expanded then
             root.Size = Vector3.new(Config.Hitbox.Size, Config.Hitbox.Size, Config.Hitbox.Size)
             root.Transparency = 0.65
+            root.CanCollide = false
         else
             root.Size = Vector3.new(2, 2, 1)
             root.Transparency = 1
+            root.CanCollide = true
         end
-        root.CanCollide = false
     end
 end
 
@@ -1056,11 +1170,9 @@ local function setInstantProximity(on)
 
         if not State.connections.instantPrompt then
             State.connections.instantPrompt = Workspace.DescendantAdded:Connect(function(descendant)
-                task.spawn(function()
-                    if descendant:IsA("ProximityPrompt") then
-                        applyPromptFix(descendant)
-                    end
-                end)
+                if descendant:IsA("ProximityPrompt") then
+                    applyPromptFix(descendant)
+                end
             end)
         end
     else
@@ -1276,6 +1388,14 @@ end
 local isAutoUpgrading = false
 local autoUpgradeToggle -- forward: set by the GUI section
 
+local lastUpgradeWarn, lastUpgradeWarnAt = nil, 0
+local function warnUpgradeThrottled(msg)
+    local now = os.clock()
+    if msg == lastUpgradeWarn and now - lastUpgradeWarnAt < 5 then return end
+    lastUpgradeWarn, lastUpgradeWarnAt = msg, now
+    warn(msg)
+end
+
 local function setAutoUpgrade(on)
     if not upgradeRemote then
         warn("[ModMenu] UpgradeBrainrot remote not found.")
@@ -1298,15 +1418,16 @@ local function setAutoUpgrade(on)
                         end)
 
                         local responseStr = tostring(response or "")
-                        if success and response then
-                            print("Successfully upgraded targeted Slot #" .. slotIndex)
-                        else
-                            warn("Failed targeted Slot #" .. slotIndex .. " | Response: " .. responseStr)
-                            if string.find(string.lower(responseStr), "money") or string.find(string.lower(responseStr), "cash") or string.find(string.lower(responseStr), "fund") or string.find(string.lower(responseStr), "afford") then
-                                fundsExhausted = true
-                                break
-                            end
+                        local lowerResponse = string.lower(responseStr)
+                        if string.find(lowerResponse, "money") or string.find(lowerResponse, "cash") or string.find(lowerResponse, "fund") or string.find(lowerResponse, "afford") then
+                            fundsExhausted = true
+                            warnUpgradeThrottled("[ModMenu] Auto-Upgrade: out of funds at Slot #" .. slotIndex)
+                            break
                         end
+                        if not success or response == false then
+                            warnUpgradeThrottled("[ModMenu] Auto-Upgrade Slot #" .. slotIndex .. " failed | Response: " .. responseStr)
+                        end
+                        -- success (including a nil return) is silent now: no console flood
 
                         task.wait(COOLDOWN_RATE)
                     end
@@ -1331,10 +1452,43 @@ local function setAutoUpgrade(on)
     end
 end
 
+-- Stop Everything (button): turn every FEATURE off through its own
+-- switch so the menu's permanent infrastructure (respawn hooks,
+-- jump/noclip listeners, join/leave hooks) keeps working afterwards.
+-- The full cleanup() below is only for re-execute teardown.
+local function stopAllFeatures()
+    for _, t in pairs(featureToggles) do
+        pcall(function() t:Set(false) end)
+    end
+    -- backstop direct offs (idempotent) in case a handle is missing
+    toggles.speedBoost = false
+    toggles.infiniteJump = false
+    toggles.autoBatToggled = false
+    toggles.instantProximity = false
+    toggles.multiPrompt = false
+    toggles.speedBypassCFrame = false
+    toggles.antiAFK = false
+    toggles.autoCollect = false
+    isAutoUpgrading = false
+    aimbotFloatVisible = false
+    refreshAimbotUI()
+    SetNoClip(false)
+    setSpeedBypass(false)
+    setPlayerESP(false)
+    setBaseESP(false)
+    setHitbox(false)
+    stopBatAimbot()
+    setInstantProximity(false)
+    setMultiPickup(false)
+    setAutoCollect(false)
+    resetWalkSpeed()
+end
+
 --============================================================================
 -- CLEANUP
 --============================================================================
 local function cleanup()
+    stopAllFeatures()
     toggles.speedBoost = false
     toggles.infiniteJump = false
     toggles.autoBatToggled = false
@@ -1419,8 +1573,8 @@ end
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "Mod Menu v3.0",
-    LoadingTitle = "Mod Menu v3.0",
+    Name = "Mod Menu v3.3",
+    LoadingTitle = "Mod Menu v3.3",
     LoadingSubtitle = "Rayfield edition",
     ShowText = "Mod Menu",
     Theme = "Default",
@@ -1443,7 +1597,7 @@ local MiscTab = Window:CreateTab("Misc", nil)
 local SettingsTab = Window:CreateTab("Settings", nil)
 
 -- ---------- Movement ----------
-MovementTab:CreateToggle({
+featureToggles.noClip = MovementTab:CreateToggle({
     Name = "NoClip",
     CurrentValue = false,
     Flag = "MM_NoClip",
@@ -1452,7 +1606,7 @@ MovementTab:CreateToggle({
     end,
 })
 
-MovementTab:CreateToggle({
+featureToggles.infJump = MovementTab:CreateToggle({
     Name = "Infinite Jump",
     CurrentValue = false,
     Flag = "MM_InfJump",
@@ -1461,7 +1615,7 @@ MovementTab:CreateToggle({
     end,
 })
 
-MovementTab:CreateToggle({
+featureToggles.speedBoost = MovementTab:CreateToggle({
     Name = "Speed Boost",
     CurrentValue = false,
     Flag = "MM_SpeedBoost",
@@ -1490,7 +1644,7 @@ MovementTab:CreateSlider({
     end,
 })
 
-MovementTab:CreateToggle({
+featureToggles.speedBypass = MovementTab:CreateToggle({
     Name = "Speed Bypass (Physics)",
     CurrentValue = false,
     Flag = "MM_SpeedBypass",
@@ -1513,7 +1667,7 @@ MovementTab:CreateSlider({
 })
 
 -- ---------- Visuals ----------
-VisualsTab:CreateToggle({
+featureToggles.playerESP = VisualsTab:CreateToggle({
     Name = "Player ESP",
     CurrentValue = false,
     Flag = "MM_PlayerESP",
@@ -1531,7 +1685,7 @@ baseEspToggle = VisualsTab:CreateToggle({
     end,
 })
 
-VisualsTab:CreateToggle({
+featureToggles.hitbox = VisualsTab:CreateToggle({
     Name = "Hitbox Expansion",
     CurrentValue = false,
     Flag = "MM_Hitbox",
@@ -1588,7 +1742,7 @@ TeleportsTab:CreateButton({
 })
 
 -- ---------- Combat ----------
-CombatTab:CreateToggle({
+featureToggles.aimbot = CombatTab:CreateToggle({
     Name = "BAT AIMBOT",
     CurrentValue = false,
     Flag = "MM_Aimbot",
@@ -1597,9 +1751,58 @@ CombatTab:CreateToggle({
         setAimbotEnabled(value)
     end,
 })
+local targetDropdown
+local function buildTargetOptions(excludeName)
+    local options = { "[Closest Player]" }
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= player and p.Name ~= excludeName then
+            options[#options + 1] = p.Name
+        end
+    end
+    return options
+end
+local function refreshTargetDropdown(excludeName)
+    if not targetDropdown then return end
+    local options = buildTargetOptions(excludeName)
+    pcall(function()
+        if type(targetDropdown.Refresh) == "function" then
+            targetDropdown:Refresh(options)
+        else
+            targetDropdown:Set(options)
+        end
+    end)
+    pcall(function() targetDropdown:Set({ State.currentTarget }) end)
+end
+
+targetDropdown = CombatTab:CreateDropdown({
+    Name = "Aimbot Target",
+    Options = buildTargetOptions(),
+    CurrentOption = { "[Closest Player]" },
+    MultipleOptions = false,
+    Callback = function(options)
+        local name = (options and options[1]) or "[Closest Player]"
+        State.currentTarget = name
+        aimbot.target = nil
+        print("[ModMenu] Aimbot target: " .. name)
+    end,
+})
+
+-- the roster list follows joins/leaves (connections live in
+-- State.connections, so only the re-execute teardown removes them)
+State.connections.targetRosterAdded = Players.PlayerAdded:Connect(function()
+    refreshTargetDropdown()
+end)
+State.connections.targetRosterRemoving = Players.PlayerRemoving:Connect(function(leaving)
+    if State.currentTarget == leaving.Name then
+        State.currentTarget = "[Closest Player]"
+        aimbot.target = nil
+    end
+    refreshTargetDropdown(leaving.Name)
+end)
+
 CombatTab:CreateParagraph({
-    Title = "Target",
-    Content = "Closest living player, same as v2.4. The floating AIM bubble appears while the aimbot toggle is on - drag it anywhere, tap it to flip the aimbot without opening the menu.",
+    Title = "Targeting",
+    Content = "Pick a player above and the aimbot locks onto them; [Closest Player] chases whoever is nearest. The list updates as players join and leave. The floating AIM bubble appears while the aimbot toggle is on - drag it anywhere, tap it to flip the aimbot without opening the menu.",
 })
 
 -- ---------- Automation ----------
@@ -1664,7 +1867,7 @@ end
 refreshSlotCount()
 
 -- ---------- Misc ----------
-MiscTab:CreateToggle({
+featureToggles.instantProx = MiscTab:CreateToggle({
     Name = "Instant Proximity",
     CurrentValue = false,
     Flag = "MM_InstantProx",
@@ -1673,7 +1876,7 @@ MiscTab:CreateToggle({
     end,
 })
 
-MiscTab:CreateToggle({
+featureToggles.multiPickup = MiscTab:CreateToggle({
     Name = "Radius Multi-Pickup",
     CurrentValue = false,
     Flag = "MM_MultiPickup",
@@ -1682,7 +1885,7 @@ MiscTab:CreateToggle({
     end,
 })
 
-MiscTab:CreateToggle({
+featureToggles.antiAFK = MiscTab:CreateToggle({
     Name = "Anti-AFK System",
     CurrentValue = false,
     Flag = "MM_AntiAFK",
@@ -1691,7 +1894,7 @@ MiscTab:CreateToggle({
     end,
 })
 
-MiscTab:CreateToggle({
+featureToggles.autoCollect = MiscTab:CreateToggle({
     Name = "Auto-Collect Currency",
     CurrentValue = false,
     Flag = "MM_AutoCollect",
@@ -1717,12 +1920,15 @@ SettingsTab:CreateDropdown({
 SettingsTab:CreateButton({
     Name = "🛑 Stop Everything (Cleanup)",
     Callback = function()
-        cleanup()
-        print("[ModMenu] Cleanup done - all features off")
+        stopAllFeatures()
+        print("[ModMenu] All features stopped - menu still live, toggles work")
     end,
 })
+
+featureToggles.baseESP = baseEspToggle
+featureToggles.autoUpgrade = autoUpgradeToggle
 
 -- remember cleanup so the next execution can stop this instance's loops first
 _envStore.__ModMenuCleanup = cleanup
 
-print("[ModMenu] v3.0 loaded - Rayfield window created")
+print("[ModMenu] v3.3 loaded - Rayfield window created")
