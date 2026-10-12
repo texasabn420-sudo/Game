@@ -1,9 +1,9 @@
--- Mod Menu v3.3 (Rayfield Gen 2)
+-- Mod Menu v3.5 (Rayfield Gen 2)
 -- Full conversion of mod-menu v2.4-fixed2: every feature carried over,
 -- only the GUI layer changed - custom frames/categories replaced by a
 -- Rayfield window (same library as the seed farm). Feature logic is the
 -- v2.4 code verbatim wherever possible.
-print("[ModMenu] v3.3 (Rayfield) loading...")
+print("[ModMenu] v3.5 (Rayfield) loading...")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -139,9 +139,24 @@ local function GetHumanoid(character)
     return character:FindFirstChildOfClass("Humanoid")
 end
 
+local function applyNoClipPass()
+    local character = GetCharacter()
+    if not character then return end
+    for _, object in ipairs(character:GetDescendants()) do
+        if object:IsA("BasePart") then
+            if State.noClipParts[object] == nil then
+                State.noClipParts[object] = object.CanCollide
+            end
+            object.CanCollide = false
+        end
+    end
+end
+
 local function SetNoClip(enabled)
     Config.Movement.NoClip = enabled
-    if not enabled then
+    if enabled then
+        applyNoClipPass() -- instant: no waiting for the first physics step
+    else
         for part, originalState in pairs(State.noClipParts) do
             if part and part.Parent then
                 part.CanCollide = originalState
@@ -185,6 +200,17 @@ local function resetWalkSpeed()
         hum.WalkSpeed = toggles.speedBoost and speedValueWalk or 16
     end
 end
+
+-- constant loop: while Speed Boost is on, the run speed is re-applied
+-- every frame, so the game (state changes, tools, scripts) can never
+-- reset WalkSpeed back down in between one-shot sets
+State.connections.speedLoop = RunService.Heartbeat:Connect(function()
+    if not toggles.speedBoost then return end
+    local hum = GetHumanoid(GetCharacter())
+    if hum and hum.WalkSpeed ~= speedValueWalk then
+        hum.WalkSpeed = speedValueWalk
+    end
+end)
 
 State.connections.infiniteJump = UserInputService.JumpRequest:Connect(function()
     if toggles.infiniteJump then
@@ -251,23 +277,11 @@ State.connections.charAdded = player.CharacterAdded:Connect(function(character)
     end
 end)
 
-local noClipAccum = 0
-State.connections.noClipLoop = RunService.Stepped:Connect(function(_, dt)
+-- constant loop: every physics frame, so nothing (state changes, game
+-- scripts, freshly streamed parts) can re-enable a collision in between
+State.connections.noClipLoop = RunService.Stepped:Connect(function()
     if not Config.Movement.NoClip then return end
-    noClipAccum += (dt or 0)
-    if noClipAccum < 0.25 then return end
-    noClipAccum = 0
-    local character = GetCharacter()
-    if not character then return end
-
-    for _, object in ipairs(character:GetDescendants()) do
-        if object:IsA("BasePart") then
-            if State.noClipParts[object] == nil then
-                State.noClipParts[object] = object.CanCollide
-            end
-            object.CanCollide = false
-        end
-    end
+    applyNoClipPass()
 end)
 
 --============================================================================
@@ -1573,8 +1587,8 @@ end
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Window = Rayfield:CreateWindow({
-    Name = "Mod Menu v3.3",
-    LoadingTitle = "Mod Menu v3.3",
+    Name = "Mod Menu v3.5",
+    LoadingTitle = "Mod Menu v3.5",
     LoadingSubtitle = "Rayfield edition",
     ShowText = "Mod Menu",
     Theme = "Default",
@@ -1931,4 +1945,4 @@ featureToggles.autoUpgrade = autoUpgradeToggle
 -- remember cleanup so the next execution can stop this instance's loops first
 _envStore.__ModMenuCleanup = cleanup
 
-print("[ModMenu] v3.3 loaded - Rayfield window created")
+print("[ModMenu] v3.5 loaded - Rayfield window created")
